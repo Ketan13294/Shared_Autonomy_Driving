@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pygame
 
 try:
     import torch
@@ -32,7 +33,7 @@ class PolicyNet(nn.Module):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, 64),
-            nn.ReLU(),
+            nn.ReLU(), 
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 2),
@@ -42,11 +43,37 @@ class PolicyNet(nn.Module):
         return self.network(x)
 
 
+def _get_keyboard_action() -> np.ndarray:
+    """Read keyboard input and return continuous action [throttle, steering].
+    
+    Arrow keys:
+      Up    -> throttle +1 (accelerate)
+      Down  -> throttle -1 (brake)
+      Left  -> steer -1 (left)
+      Right -> steer +1 (right)
+    """
+    keys = pygame.key.get_pressed()
+    
+    throttle = 0.0
+    if keys[pygame.K_UP]:
+        throttle = 1.0
+    elif keys[pygame.K_DOWN]:
+        throttle = -1.0
+    
+    steering = 0.0
+    if keys[pygame.K_LEFT]:
+        steering = -1.0
+    elif keys[pygame.K_RIGHT]:
+        steering = 1.0
+    
+    return np.array([throttle, steering], dtype=np.float32)
+
+
 def _flatten_observation(obs) -> np.ndarray:
     """Convert environment observation to flat float32 vector."""
     return np.asarray(obs, dtype=np.float32).reshape(-1)
 
-
+ 
 def _stack_observations(stack: deque, stack_size: int) -> np.ndarray:
     """Concatenate stacked observations for temporal context."""
     frames = list(stack)
@@ -140,9 +167,10 @@ def main() -> None:
 
     try:
         step = 0
-        action = np.zeros(env.action_space.shape, dtype=np.float32)
-        print(action)
         while True:
+            # Read keyboard input every frame
+            action = _get_keyboard_action()
+            
             obs, reward, terminated, truncated, info = env.step(action)
 
             # Update observation stack and check safety

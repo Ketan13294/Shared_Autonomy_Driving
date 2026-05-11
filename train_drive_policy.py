@@ -151,15 +151,17 @@ def train(
 
     env = TwoLaneOvertakingEnv(config=config, render_mode=None)
 
+    print(f"Action Space: {env.action_space.shape[0]} | Observation Space: {env.observation_space.shape}")
+
     # Build observation shape by resetting once
     init_obs, _ = env.reset()
-    print(init_obs)
     flat = _flatten_observation(init_obs)
     obs_dim = flat.size * stack_size + 2  # +2 for user_turn and user_speed_delta
-    act_dim = env.action_space.n
+    act_dim = env.action_space.shape[0]
 
     policy = ActorCritic(obs_dim, act_dim).to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    log_std = torch.nn.Parameter(torch.zeros(act_dim, device=device))
+    optimizer = torch.optim.Adam(list(policy.parameters()) + [log_std], lr=lr)
     start_epoch = 1
 
     if resume is not None:
@@ -181,6 +183,11 @@ def train(
 
         policy.load_state_dict(checkpoint["state_dict"])
 
+        # Load log_std if available in checkpoint
+        checkpoint_log_std = checkpoint.get("log_std")
+        if checkpoint_log_std is not None:
+            log_std.data = checkpoint_log_std.to(device)
+
         optimizer_state = checkpoint.get("optimizer_state_dict")
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
@@ -194,10 +201,15 @@ def train(
 
     def get_action_and_value(obs_tensor):
         logits, value = policy(obs_tensor)
-        probs = torch.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
+        # Apply tanh to squash to [-1, 1]
+        mean = torch.tanh(logits)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
         action = dist.sample()
-        return action.item(), dist.log_prob(action).item(), value.item()
+        # Clamp action to [-1, 1] to ensure it's in bounds
+        action_clamped = torch.clamp(action, -1.0, 1.0)
+        logp = dist.log_prob(action_clamped).sum(dim=-1)
+        return action_clamped.squeeze(0).cpu().numpy(), logp.item(), value.item()
 
     def pack_obs(stack, user_turn_flag, user_speed_delta):
         arr = np.concatenate(list(stack), axis=0)
@@ -241,6 +253,46 @@ def train(
             max_y = lane_width * (lane_count - 0.5)
             if y < min_y or y > max_y:
                 reward -= 5.0
+            
+            # Potential-based reward: encourage staying centered or moving to target lane based on user_turn
+            # Compute distance to nearest lane edge to discourage drifting toward boundaries
+            
+            # Determine target lateral position based on user_turn input
+            if user_turn == 1:
+                # User is requesting a lane change: target the adjacent lane center
+                # In a two-lane setup, lanes are centered at 0 and lane_width
+                if prev_lane == 0:
+                    target_y = lane_width  # Move to left lane (higher y)
+                else:
+                    target_y = 0.0  # Move to right lane (lower y)
+            else:
+                # No lane change requested: maintain current lane center
+                target_y = prev_lane * lane_width
+            
+            # Compute distance from current position to target lane center
+            distance_to_target = abs(y - target_y)
+            
+            # Compute distance to nearest lane edge to discourage drifting toward boundaries
+            distance_to_lower_edge = y - min_y
+            distance_to_upper_edge = max_y - y
+            distance_to_nearest_edge = min(distance_to_lower_edge, distance_to_upper_edge)
+            
+            # Apply a smooth penalty as vehicle approaches lane edges (within 0.3m)
+            # The potential function increases penalty as we get closer to edges
+            edge_buffer_threshold = 0.3  # meters
+            if distance_to_nearest_edge < edge_buffer_threshold and distance_to_nearest_edge > 0:
+                # Quadratic penalty: getting closer to edge increases penalty non-linearly
+                lateral_potential_penalty = -2.0 * ((edge_buffer_threshold - distance_to_nearest_edge) / edge_buffer_threshold) ** 2
+                reward += lateral_potential_penalty
+            elif distance_to_nearest_edge <= 0:
+                # Already off-road (covered by hard penalty above, but for safety)
+                pass
+            else:
+                # Safe distance from edges: reward movement toward target lane
+                # The reward increases as the vehicle gets closer to the target lateral position
+                lane_width_half = lane_width / 2.0
+                centering_bonus = 0.1 * max(0.0, 1.0 - distance_to_target / lane_width_half)
+                reward += centering_bonus
 
             # Penalize collisions heavily (env already has collision reward but be explicit)
             if info.get("crashed", False) or terminated and reward < 0:
@@ -266,12 +318,12 @@ def train(
                     reward -= 5.0 * max(0.0, ego_speed - 8.0) * (min_safe_dist - gap_ahead) / min_safe_dist
                     # Reward the slow-down action itself when the ego is inside the safe following distance.
                     # This is independent of user speed input so the policy learns to brake whenever needed.
-                    if action == ACTION_SLOWER:
+                    if action[0] < 0.0:
                         reward += 1.0     
             # Reward compliance with user speed commands (if safe)
-            elif (gap_ahead == float("inf") or gap_ahead >= min_safe_dist) and ((user_speed_delta == 1 and action == ACTION_FASTER) or (user_speed_delta == -1 and action == ACTION_SLOWER)):
+            elif (gap_ahead == float("inf") or gap_ahead >= min_safe_dist) and ((user_speed_delta == 1 and action[0] > 0.0) or (user_speed_delta == -1 and action[0] < 0.0)):
                 # User wants to speed up and it's safe -> small reward for attempting acceleration
-                reward += 2.0
+                reward += 1.0
 
             # Discourage lane change unless the user explicitly requested it.
             if current_lane != prev_lane and user_turn == 0:
@@ -280,6 +332,7 @@ def train(
                 desired_lane_action = _desired_lane_change_action(prev_lane)
                 if action == desired_lane_action:
                     reward += 1.0
+
 
 
             # Reward for staying alive.
@@ -325,7 +378,7 @@ def train(
 
         # Convert to tensors
         obs_tensor = torch.from_numpy(np.stack(batch.obs)).float().to(device)
-        actions_tensor = torch.from_numpy(np.array(batch.actions)).long().to(device)
+        actions_tensor = torch.from_numpy(np.stack(batch.actions)).float().to(device)
         old_logps_tensor = torch.from_numpy(np.array(batch.logps)).float().to(device)
         adv_tensor = torch.from_numpy(advantages).float().to(device)
         ret_tensor = torch.from_numpy(returns).float().to(device)
@@ -333,14 +386,18 @@ def train(
         # PPO updates
         for _ in range(8):
             logits, vals = policy(obs_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            logps = dist.log_prob(actions_tensor)
+            # Apply tanh to squash to [-1, 1]
+            mean = torch.tanh(logits)
+            std = torch.exp(log_std)
+            dist = torch.distributions.Normal(mean, std)
+            # Clamp actions to [-1, 1]
+            actions_clamped = torch.clamp(actions_tensor, -1.0, 1.0)
+            logps = dist.log_prob(actions_clamped).sum(dim=-1)
             ratio = torch.exp(logps - old_logps_tensor)
             clip = 0.2
             pg_loss = -torch.mean(torch.min(ratio * adv_tensor, torch.clamp(ratio, 1 - clip, 1 + clip) * adv_tensor))
             v_loss = torch.mean((ret_tensor - vals) ** 2)
-            entropy = torch.mean(dist.entropy())
+            entropy = torch.mean(dist.entropy().sum(dim=-1))
             loss = pg_loss + 0.5 * v_loss - 0.01 * entropy
 
             optimizer.zero_grad()
@@ -358,7 +415,14 @@ def train(
 
     # Save model
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": policy.state_dict(), "obs_dim": obs_dim, "act_dim": act_dim, "stack_size": stack_size}, output)
+    torch.save({
+        "state_dict": policy.state_dict(),
+        "log_std": log_std.data,
+        "obs_dim": obs_dim,
+        "act_dim": act_dim,
+        "stack_size": stack_size,
+        "epoch": epoch
+    }, output)
     env.close()
     print(f"Saved trained drive policy to {output}")
 

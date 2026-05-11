@@ -19,6 +19,8 @@ import time
 import gymnasium as gym
 import numpy as np
 
+import pygame
+
 try:
     import torch
     from torch import nn
@@ -28,73 +30,50 @@ except ModuleNotFoundError as exc:
 from overtaking_environment import TwoLaneOvertakingEnv, register_two_lane_overtaking_env
 from highway_env.road.lane import StraightLane
 
-try:
-    from pynput import keyboard
-except ModuleNotFoundError:
-    keyboard = None
-
 
 def _flatten_observation(obs) -> np.ndarray:
+    # The environment returns structured observations; the policy expects a flat vector.
     return np.asarray(obs, dtype=np.float32).reshape(-1)
 
 
 def _lane_id(vehicle) -> int:
+    # Map the vehicle's lateral position to a lane index using the lane width.
     return int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
 
 
-class KeyboardState:
-    """Track held keyboard input so commands stay active while a key is pressed."""
-
-    def __init__(self) -> None:
-        self.turn = 0
-        self.speed_delta = 0
-        self.quit = False
-        self._listener = None
-
-    def _on_press(self, key):
-        try:
-            char = key.char.lower()
-        except AttributeError:
-            return
-
-        if char == "t":
-            self.turn = 1
-        elif char == "w":
-            self.speed_delta = 1
-        elif char == "s":
-            self.speed_delta = -1
-        elif char == "q":
-            self.quit = True
-
-    def _on_release(self, key):
-        try:
-            char = key.char.lower()
-        except AttributeError:
-            return
-
-        if char == "t":
-            self.turn = 0
-        elif char in {"w", "s"}:
-            self.speed_delta = 0
-
-    def start(self) -> None:
-        if keyboard is None:
-            raise SystemExit(
-                "pynput is required for held-key input. Install it with 'pip install pynput' or run without --manual_input."
-            )
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-        self._listener.start()
-
-    def stop(self) -> None:
-        if self._listener is not None:
-            self._listener.stop()
+def _get_keyboard_input() -> tuple[int, int, bool]:
+    # Poll the current keyboard state every frame so held keys stay active.
+    """Read keyboard input and return (user_turn, user_speed_delta, quit).
+    
+    Key mappings:
+      't' -> lane change (user_turn=1)
+      'w' -> speed up (user_speed_delta=1)
+      's' -> speed down (user_speed_delta=-1)
+      'q' -> quit
+    """
+    keys = pygame.key.get_pressed()
+    
+    user_turn = 1 if keys[pygame.K_t] else 0
+    user_speed_delta = 0
+    if keys[pygame.K_w]:
+        user_speed_delta = 1
+    elif keys[pygame.K_s]:
+        user_speed_delta = -1
+    
+    quit_requested = keys[pygame.K_q]
+    
+    return user_turn, user_speed_delta, quit_requested
 
 
 class ActorCritic(nn.Module):
+    # Shared trunk followed by separate actor and critic heads.
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
         super().__init__()
+        # The shared trunk extracts a compact latent representation from the stacked input.
         self.shared = nn.Sequential(nn.Linear(obs_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU())
+        # The actor head predicts the two raw control values for continuous driving.
         self.actor = nn.Linear(hidden, act_dim)
+        # The critic head estimates state value for logging and potential training use.
         self.critic = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor):
@@ -103,8 +82,10 @@ class ActorCritic(nn.Module):
 
 
 def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, render: bool, user_turn_prob: float, manual_input: bool):
+    # Register the custom highway-env environment before creating it.
     register_two_lane_overtaking_env()
 
+    # Use the same environment settings as training so the checkpoint stays compatible.
     config = TwoLaneOvertakingEnv.default_config()
     config.update(
         {
@@ -119,12 +100,14 @@ def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, rend
         }
     )
 
+    # Render in a window only when requested; otherwise run headless.
     render_mode = "human" if render else None
     # env = gym.make("TwoLaneOvertaking-v0", render_mode=render_mode, config=config)
     env = TwoLaneOvertakingEnv(config=config, render_mode=render_mode)
 
 
     try:
+        # Load the saved policy checkpoint on the active device.
         data = torch.load(policy_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
     except Exception as exc:
         # Newer PyTorch versions may default to weights_only=True which
@@ -139,23 +122,32 @@ def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, rend
     # Load stack_size from checkpoint; if not present, use the provided value
     checkpoint_stack_size = data.get("stack_size")
     if checkpoint_stack_size is not None:
+        # Match the observation stacking width used during training.
         stack_size = int(checkpoint_stack_size)
         print(f"Loaded stack_size={stack_size} from checkpoint")
 
+    # Rebuild the policy architecture and restore its learned weights.
     policy = ActorCritic(obs_dim=obs_dim, act_dim=act_dim)
     policy.load_state_dict(data["state_dict"])
     policy.eval()
 
-    keyboard_state = None
-    if manual_input:
-        print("Starting continuous simulation.")
-        print("  Hold 't' = lane change, hold 'w' = speed up, hold 's' = slow down, press 'q' = quit")
-        keyboard_state = KeyboardState()
-        keyboard_state.start()
+    # Load log_std for continuous action distribution
+    checkpoint_log_std = data.get("log_std")
+    if checkpoint_log_std is None:
+        # Fallback for old checkpoints without log_std
+        log_std = torch.ones(act_dim) * 0.0
+    else:
+        log_std = checkpoint_log_std
 
-    # for ep in range(1, episodes + 1):
-    for _ in range(1,2):
+    if manual_input:
+        # Explain the held-key controls before entering the simulation loop.
+        print("Starting interactive simulation.")
+        print("  Hold 't' = lane change, hold 'w' = speed up, hold 's' = slow down, press 'q' = quit")
+
+    # This outer loop keeps the script ready for multiple episodes if the flow is expanded later.
+    for _ in range(1, 2):
         ep = 1
+        # Reset the environment and initialize the stacked observation history.
         obs, _ = env.reset()
         flat = _flatten_observation(obs)
         obs_stack = deque(maxlen=stack_size)
@@ -167,30 +159,33 @@ def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, rend
         user_turn = 0
         user_speed_delta = 0
         while True:
+            # Advance one control cycle at a time.
             step += 1
-            # Check for held key state (non-blocking)
             if manual_input:
-                if keyboard_state is None:
-                    raise RuntimeError("Keyboard state not initialized.")
-                if keyboard_state.quit:
+                # Use the current pressed-key state so held keys are not missed between frames.
+                user_turn, user_speed_delta, quit_requested = _get_keyboard_input()
+                if quit_requested:
                     print("\nQuitting.")
-                    keyboard_state.stop()
                     env.close()
                     return
-                user_turn = keyboard_state.turn
-                user_speed_delta = keyboard_state.speed_delta
-            # else:
-            #     user_turn = 1 if random.random() < user_turn_prob else 0
-            #     user_speed_delta = random.choice([-1, 0, 1]) if random.random() < 0.1 else 0
+            else:
+                # During non-interactive runs, synthesize user commands probabilistically.
+                user_turn = 1 if random.random() < user_turn_prob else 0
+                user_speed_delta = random.choice([-1, 0, 1]) if random.random() < 0.1 else 0
 
+            # Append the user inputs to the stacked observation so the policy can condition on them.
             obs_vec = np.concatenate(list(obs_stack), axis=0)
             obs_vec = np.concatenate([obs_vec, np.array([float(user_turn), float(user_speed_delta)], dtype=np.float32)], axis=0)
             obs_tensor = torch.from_numpy(obs_vec).float().unsqueeze(0)
 
             with torch.no_grad():
+                # The actor predicts the raw mean action, then we squash and sample a bounded continuous command.
                 logits, value = policy(obs_tensor)
-                probs = torch.softmax(logits, dim=-1).cpu().numpy().squeeze(0)
-                action = int(np.argmax(probs))
+                # Apply tanh to squash to [-1, 1]
+                mean = torch.tanh(logits)
+                std = torch.exp(log_std)
+                action = torch.clamp(mean + torch.randn_like(mean) * std, -1.0, 1.0).squeeze(0).cpu().numpy()
+            # Send the continuous two-dimensional action directly to the environment.
             next_obs, reward, terminated, truncated, info = env.step(action)
             ego = env.unwrapped.controlled_vehicles[0]
             lane = _lane_id(ego)
@@ -198,6 +193,7 @@ def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, rend
             # compute gap ahead roughly
             ego_x = float(ego.position[0])
             best = float("inf")
+            # Scan vehicles in the same lane to estimate how much room is ahead of the ego vehicle.
             for v in env.unwrapped.road.vehicles:
                 if v is ego:
                     continue
@@ -209,33 +205,38 @@ def play(policy_path: Path, episodes: int, max_steps: int, stack_size: int, rend
             if best < 1e6:
                 gap_ahead = best
 
+            # Print a compact step-by-step trace so it is easy to inspect policy behavior.
             print(f"Ep {ep} Step {step} | reward={reward:.3f} | total={total_reward+reward:.3f} | action={action} | user_turn={user_turn} | user_speed={user_speed_delta:+d} | lane={lane} | gap_ahead={gap_ahead:.2f} | crashed={info.get('crashed', False)}")
 
             total_reward += float(reward)
 
+            # Shift the observation stack forward with the newest frame.
             flat_next = _flatten_observation(next_obs)
             obs_stack.append(flat_next)
 
             if render:
                 # some renderers require calling env.render(); gymnasium with render_mode='human' may render on step
                 try:
+                    # Keep the render call guarded so headless backends do not crash the loop.
                     env.render()
                 except Exception:
                     pass
 
             if terminated or truncated:
+                # End the current episode as soon as the environment reports termination.
                 print(f"Episode {ep} finished after {step} steps | total_reward={total_reward:.3f}")
                 break
+            # Pace the loop to the environment's policy frequency so keyboard input and rendering stay in sync.
             time.sleep(1.0 / env.unwrapped.config["policy_frequency"])
         else:
             print(f"Episode {ep} reached max steps | total_reward={total_reward:.3f}")
 
-    if keyboard_state is not None:
-        keyboard_state.stop()
+    # Always close the environment on exit so the window and simulator resources are released cleanly.
     env.close()
 
 
 def parse_args():
+    # Define the command-line interface for selecting the checkpoint and interactive mode.
     p = argparse.ArgumentParser(description="Play a trained driving policy.")
     p.add_argument("--policy", type=Path, default=Path("artifacts/drive_policy.pt"))
     p.add_argument("--episodes", type=int, default=5)
@@ -248,6 +249,7 @@ def parse_args():
 
 
 def main():
+    # Parse CLI options and dispatch into the interactive playback loop.
     args = parse_args()
     play(
         policy_path=args.policy,

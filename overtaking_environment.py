@@ -8,7 +8,7 @@ from highway_env.envs import HighwayEnv
 from highway_env.road.lane import LineType, StraightLane
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.behavior import IDMVehicle
-from highway_env.vehicle.controller import MDPVehicle
+from highway_env.vehicle.controller import MDPVehicle, ControlledVehicle
 from highway_env.vehicle.kinematics import Vehicle
 
 from overtaking_constants import PATTERN_CLUSTER, PATTERN_MIXED, PATTERN_SPARSE
@@ -34,18 +34,33 @@ class TwoLaneOvertakingEnv(HighwayEnv):
                 "blocker_speed": 15.0,
                 "blocker_distance": 30.0,
                 # Discrete actions make the task easier to learn and evaluate than continuous control.
+                # "action": {
+                #     "type": "DiscreteMetaAction",
+                #     "target_speeds": [15, 17.5, 20, 22.5, 25, 27.5, 30],
+                # },
+                # Continuous actions let the policy choose any acceleration and steering, which is more realistic but harder to learn from.
                 "action": {
-                    "type": "DiscreteMetaAction",
-                    "target_speeds": [15, 20, 25, 30],
+                    "type": "ContinuousAction",
+                    "longitudinal": True,
+                    "lateral": True,
+                    "dynamical": True,
                 },
                 # Kinematics observations expose nearby vehicles directly to the policy.
                 "observation": {
                     "type": "Kinematics",
                     "vehicles_count": 8,
-                    "features": ["presence", "x", "y", "vx", "vy"],
-                    "normalize": False,
+                    "features": ["presence", "x", "y", "vx", "vy", "cos_h", "sin_h", "ang_off"],
+                    "normalize": True,
                     "absolute": True,
                 },
+                # Image observations expose nearby vehicles to the policy through rendering, which is more realistic but harder to learn from.
+                # "observations":{
+                #     "type" : "GrayscaleObservation",
+                #     "observation_shape": (128, 84),
+                #     "stack_size": 4,
+                #     "weights": [0.2989, 0.5870, 0.1140],  # weights for RGB conversion
+                #     "scaling": 1.75,
+                # },
                 # Reward values encourage safe progress while penalizing collisions and unnecessary weaving.
                 "collision_reward": -5.0,
                 "high_speed_reward": 0.3,
@@ -56,7 +71,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
                 # Episodes are long enough for one or two overtakes, but not long enough to become a cruising task.
                 "duration": 90,
                 "simulation_frequency": 15,
-                "policy_frequency": 5,
+                "policy_frequency": 2,
                 # Traffic presets let training cover different densities without changing the environment definition.
                 "traffic_pattern": PATTERN_CLUSTER,
                 "vehicles_count": 0,
@@ -117,7 +132,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
             "speed": self.config["ego_speed"],
         }
         if ego_vehicle_class is MDPVehicle:
-            ego_kwargs["target_speeds"] = np.array([15.0, 20.0, 25.0, 30.0])
+            ego_kwargs["target_speeds"] = np.array([15.0, 17.5, 20.0, 22.5, 25.0, 27.5, 30.0])
         ego = ego_vehicle_class(**ego_kwargs)
         self.controlled_vehicles.append(ego)
         self.road.vehicles.append(ego)
@@ -149,7 +164,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         # Continuous control uses the base Vehicle class; discrete control uses highway-env's MDPVehicle wrapper.
         action_type = self.config.get("action", {}).get("type", "DiscreteMetaAction")
         if action_type == "ContinuousAction":
-            return Vehicle
+            return ControlledVehicle
         return MDPVehicle
 
     def _make_idm(
