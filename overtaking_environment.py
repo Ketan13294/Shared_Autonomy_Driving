@@ -19,19 +19,26 @@ class TwoLaneOvertakingEnv(HighwayEnv):
 
     @classmethod
     def default_config(cls) -> dict:
+        # Keep the environment short and structured so overtaking is the main challenge.
         config = super().default_config()
         config.update(
             {
+                # Two lanes are enough to represent the passing decision without adding unnecessary complexity.
                 "lanes_count": 2,
+                # Shorter roads keep episodes focused on a few overtaking opportunities.
                 "road_length": 1500,
+                # The ego starts in the right lane, which is the natural place to begin a pass from.
                 "initial_lane_id": 0,
+                # The ego and blocker speeds create a clear incentive to change lanes.
                 "ego_speed": 22.0,
                 "blocker_speed": 15.0,
-                "blocker_distance": 60.0,
+                "blocker_distance": 30.0,
+                # Discrete actions make the task easier to learn and evaluate than continuous control.
                 "action": {
                     "type": "DiscreteMetaAction",
                     "target_speeds": [15, 20, 25, 30],
                 },
+                # Kinematics observations expose nearby vehicles directly to the policy.
                 "observation": {
                     "type": "Kinematics",
                     "vehicles_count": 8,
@@ -39,17 +46,21 @@ class TwoLaneOvertakingEnv(HighwayEnv):
                     "normalize": False,
                     "absolute": True,
                 },
+                # Reward values encourage safe progress while penalizing collisions and unnecessary weaving.
                 "collision_reward": -5.0,
                 "high_speed_reward": 0.3,
-                "right_lane_reward": 0.1,
-                "lane_change_reward": -0.05,
+                "right_lane_reward": 0.0,
+                "lane_change_reward": 0.00,
                 "reward_speed_range": [20, 30],
                 "normalize_reward": True,
+                # Episodes are long enough for one or two overtakes, but not long enough to become a cruising task.
                 "duration": 90,
                 "simulation_frequency": 15,
                 "policy_frequency": 5,
-                "traffic_pattern": PATTERN_SPARSE,
+                # Traffic presets let training cover different densities without changing the environment definition.
+                "traffic_pattern": PATTERN_CLUSTER,
                 "vehicles_count": 0,
+                "manual_control": False,
             }
         )
         return config
@@ -59,6 +70,8 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         width = StraightLane.DEFAULT_WIDTH
         length = self.config["road_length"]
 
+        # Lane 0 is the ego lane; lane 1 is the adjacent passing lane.
+        # Distinct line markings help the rendered scene stay readable.
         for lane_id in range(2):
             origin = np.array([0.0, lane_id * width])
             end = np.array([float(length), lane_id * width])
@@ -83,8 +96,19 @@ class TwoLaneOvertakingEnv(HighwayEnv):
     def _create_vehicles(self) -> None:
         self.controlled_vehicles = []
 
-        ego_lane = self.road.network.get_lane(("start", "end", 0))
-        ego_x = 50.0
+        # Randomly assign ego and blocker to lanes and positions.
+        ego_lane_id = int(self.np_random.choice([0, 1]))
+        blocker_lane_id = int(self.np_random.choice([0, 1]))
+        
+        # Sample longitudinal positions from a range to avoid spawning too close to the road edge.
+        ego_x = float(self.np_random.uniform(40.0, 150.0))
+        blocker_x = float(self.np_random.uniform(40.0, 300.0))
+        
+        # Ensure ego and blocker are not too close (at least 30 units apart if in the same lane).
+        if ego_lane_id == blocker_lane_id and abs(ego_x - blocker_x) < 30.0:
+            blocker_x = ego_x + 50.0
+        
+        ego_lane = self.road.network.get_lane(("start", "end", ego_lane_id))
         ego_vehicle_class = self._ego_vehicle_class()
         ego_kwargs = {
             "road": self.road,
@@ -98,27 +122,31 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         self.controlled_vehicles.append(ego)
         self.road.vehicles.append(ego)
 
-        blocker_x = ego_x + self.config["blocker_distance"]
+        blocker_lane = self.road.network.get_lane(("start", "end", blocker_lane_id))
         blocker = IDMVehicle(
             road=self.road,
-            position=ego_lane.position(blocker_x, 0),
-            heading=ego_lane.heading_at(blocker_x),
+            position=blocker_lane.position(blocker_x, 0),
+            heading=blocker_lane.heading_at(blocker_x),
             speed=self.config["blocker_speed"],
             enable_lane_change=False,
         )
         self.road.vehicles.append(blocker)
 
-        lane1 = self.road.network.get_lane(("start", "end", 1))
         pattern = self.config["traffic_pattern"]
-
-        if pattern == PATTERN_SPARSE:
-            self._add_sparse_traffic(lane1)
-        elif pattern == PATTERN_CLUSTER:
-            self._add_cluster_traffic(lane1)
-        elif pattern == PATTERN_MIXED:
-            self._add_mixed_traffic(lane1)
+        
+        # Add traffic to any lane not occupied by ego (to give the overtaking task variety).
+        for lane_id in [0, 1]:
+            if lane_id != ego_lane_id:
+                lane = self.road.network.get_lane(("start", "end", lane_id))
+                if pattern == PATTERN_SPARSE:
+                    self._add_sparse_traffic(lane)
+                elif pattern == PATTERN_CLUSTER:
+                    self._add_cluster_traffic(lane)
+                elif pattern == PATTERN_MIXED:
+                    self._add_mixed_traffic(lane)
 
     def _ego_vehicle_class(self):
+        # Continuous control uses the base Vehicle class; discrete control uses highway-env's MDPVehicle wrapper.
         action_type = self.config.get("action", {}).get("type", "DiscreteMetaAction")
         if action_type == "ContinuousAction":
             return Vehicle
@@ -131,6 +159,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         speed: float,
         enable_lane_change: bool = False,
     ) -> IDMVehicle:
+        # Central helper for all background traffic so every preset is built from the same placement logic.
         vehicle = IDMVehicle(
             road=self.road,
             position=lane.position(x, 0),
@@ -141,26 +170,142 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         self.road.vehicles.append(vehicle)
         return vehicle
 
+    def _make_random_idm(
+        self,
+        lane: StraightLane,
+        x_min: float,
+        x_max: float,
+        speed: float,
+        enable_lane_change: bool = False,
+    ) -> IDMVehicle:
+        # Sample a longitudinal position so each reset can produce a different traffic layout.
+        x = float(self.np_random.uniform(x_min, x_max))
+        return self._make_idm(lane, x=x, speed=speed, enable_lane_change=enable_lane_change)
+
     def _add_sparse_traffic(self, lane: StraightLane) -> None:
-        self._make_idm(lane, x=200.0, speed=28.0)
-        self._make_idm(lane, x=400.0, speed=26.0)
+        # Sparse traffic gives the ego more open space, which makes the pass easier and the rewards steadier.
+        self._make_random_idm(lane, x_min=180.0, x_max=320.0, speed=28.0)
+        self._make_random_idm(lane, x_min=380.0, x_max=560.0, speed=26.0)
 
     def _add_cluster_traffic(self, lane: StraightLane) -> None:
-        self._make_idm(lane, x=130.0, speed=20.0)
-        self._make_idm(lane, x=155.0, speed=20.0)
-        self._make_idm(lane, x=180.0, speed=20.0)
-        self._make_idm(lane, x=430.0, speed=22.0)
+        # Clustered traffic places several slow vehicles close together so the ego has to react to a queue.
+        self._make_random_idm(lane, x_min=120.0, x_max=160.0, speed=20.0)
+        self._make_random_idm(lane, x_min=145.0, x_max=185.0, speed=20.0)
+        self._make_random_idm(lane, x_min=170.0, x_max=215.0, speed=20.0)
+        self._make_random_idm(lane, x_min=400.0, x_max=520.0, speed=22.0)
 
     def _add_mixed_traffic(self, lane: StraightLane) -> None:
-        self._make_idm(lane, x=160.0, speed=27.0)
-        self._make_idm(lane, x=240.0, speed=18.0)
-        self._make_idm(lane, x=330.0, speed=29.0)
-        self._make_idm(lane, x=440.0, speed=17.0)
+        # Mixed traffic alternates between faster and slower cars to create a less predictable passing lane.
+        self._make_random_idm(lane, x_min=140.0, x_max=220.0, speed=27.0)
+        self._make_random_idm(lane, x_min=220.0, x_max=300.0, speed=18.0)
+        self._make_random_idm(lane, x_min=300.0, x_max=380.0, speed=29.0)
+        self._make_random_idm(lane, x_min=420.0, x_max=520.0, speed=17.0)
+
+    def _draw_ego_speed_overlay(self):
+        """Draw ego speed in the rendered GUI (best-effort; only when pygame is used)."""
+        try:
+            import pygame
+            import math
+
+            screen = None
+            try:
+                screen = pygame.display.get_surface()
+            except Exception:
+                screen = None
+            if screen is None:
+                return
+
+            if not getattr(self, "controlled_vehicles", None):
+                return
+
+            ego = self.controlled_vehicles[0]
+            # Try several ways to obtain ego speed so overlay works across vehicle implementations
+            speed = getattr(ego, "speed", None)
+            if speed is None:
+                # Some vehicles expose velocity as a vector or scalar
+                vel = getattr(ego, "velocity", None) or getattr(ego, "vel", None)
+                try:
+                    if vel is None:
+                        # Try a method
+                        vel = ego.get_velocity()
+                except Exception:
+                    vel = None
+                if vel is not None:
+                    try:
+                        # If vel is a sequence, take its norm; if scalar, use it directly
+                        # Convert possible types (numpy arrays, lists, vectors) to numbers
+                        if hasattr(vel, "__iter__"):
+                            vals = list(vel)
+                            # Take first two components if available
+                            x = float(vals[0]) if len(vals) >= 1 else 0.0
+                            y = float(vals[1]) if len(vals) >= 2 else 0.0
+                            import math
+
+                            speed = math.hypot(x, y)
+                        else:
+                            # Some vehicles return custom vector objects with x/y attrs
+                            x = getattr(vel, "x", None)
+                            y = getattr(vel, "y", None)
+                            if x is not None and y is not None:
+                                import math
+
+                                speed = math.hypot(float(x), float(y))
+                            else:
+                                speed = float(vel)
+                    except Exception:
+                        speed = None
+            if speed is None:
+                return
+
+            closest_ahead = None
+            ego_lane = None
+            ego_x = None
+            try:
+                ego_lane = ego.lane_index[2]
+                ego_x = float(ego.position[0])
+            except Exception:
+                ego_lane = None
+                ego_x = None
+
+            if ego_lane is not None and ego_x is not None and getattr(self, "road", None) is not None:
+                for vehicle in getattr(self.road, "vehicles", []):
+                    if vehicle is ego:
+                        continue
+                    try:
+                        if vehicle.lane_index[2] != ego_lane:
+                            continue
+                        delta_x = float(vehicle.position[0]) - ego_x
+                        if delta_x >= 0.0 and (closest_ahead is None or delta_x < closest_ahead):
+                            closest_ahead = delta_x
+                    except Exception:
+                        continue
+
+            distance_text = "N/A" if closest_ahead is None else f"{closest_ahead:.2f}"
+            text = f"Speed: {speed:.2f} | Closest car ahead: {distance_text}"
+            pygame.font.init()
+            font = pygame.font.SysFont(None, 28)
+            surf = font.render(text, True, (255, 255, 255))
+
+            sw, sh = screen.get_size()
+            tw, th = surf.get_size()
+            # Upper-right with small margin
+            screen.blit(surf, (sw - tw - 10, 10))
+            pygame.display.flip()
+        except Exception:
+            # Never raise from rendering overlay
+            return
+
+    def render(self, *args, **kwargs):
+        """Override render to include ego speed overlay."""
+        result = super().render(*args, **kwargs)
+        self._draw_ego_speed_overlay()
+        return result
 
 
 def register_two_lane_overtaking_env() -> None:
     """Register the custom gymnasium environment once."""
     try:
+        # Gymnasium keeps a global registry, so duplicate registration is harmless but ignored.
         gym.register(
             id="TwoLaneOvertaking-v0",
             entry_point=TwoLaneOvertakingEnv,
