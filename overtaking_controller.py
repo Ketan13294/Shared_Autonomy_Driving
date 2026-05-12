@@ -6,6 +6,7 @@ Returns continuous 2D actions [acceleration, steering] in [-1, 1] mapped from di
 import numpy as np
 
 from highway_env.road.lane import StraightLane
+from highway_env.road.road import LaneIndex
 from highway_env.vehicle.controller import MDPVehicle, ControlledVehicle
 
 from overtaking_constants import (
@@ -34,81 +35,122 @@ class OvertakingController:
 
     def __init__(self) -> None:
         self.state = STATE_CLEAR
+        # A live reference to the ego vehicle so controller and env share the same object
+        self.v = None
+        # Track the target lane for persistent steering during merges
+        self.merge_out_target_lane = None
 
     def reset(self) -> None:
         self.state = STATE_CLEAR
+        # Clear the cached ego reference; will be re-attached on next action
+        self.v = None
+        # Clear the merge target when resetting
+        self.merge_out_target_lane = None
 
-    def act_upper(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple) -> int:
+    def act_upper(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple) -> tuple[int, int]:
+        """
+        Return separate speed and heading actions.
+        
+        Steering logic: if a merge is in progress (merge_out_target_lane is set),
+        persist the steering action until:
+          1. Lane change completes (ego reaches target lane), OR
+          2. User provides a different steering input
+        
+        Returns:
+            (speed_action, heading_action) where each is -1 (slow/left), 0 (idle), or +1 (fast/right)
+        """
+        # Ensure we have a live reference to the ego vehicle (attach on first use)
         ego = env.controlled_vehicles[0]
-        ego_lane = int(round(ego.position[1] / StraightLane.DEFAULT_WIDTH))
-
+        ego_lane = ego.lane_index[2]
         user_speed, user_steering = user_input
 
-        dist_to_blocker = self._signed_dist_nearest_in_lane(env, ego, lane_id=0)
+        dist_to_blocker = self._signed_dist_nearest_in_lane(env, ego, lane_id=ego_lane)
         gap_ahead_l1, gap_behind_l1 = self._scan_lane(env, ego, lane_id=ego_lane ^ 1)
 
-        action = ACTION_IDLE
+        action_speed = ACTION_IDLE
+        if dist_to_blocker > 0 and dist_to_blocker < FOLLOW_DISTANCE_MIN:
+            action_speed = ACTION_SLOWER
+        elif dist_to_blocker < 0 and -dist_to_blocker < FOLLOW_DISTANCE_MIN:
+            action_speed = ACTION_FASTER
+        elif user_speed:
+            if user_speed > 0:
+                action_speed = ACTION_FASTER
+            elif user_speed < 0:
+                action_speed = ACTION_SLOWER
+
+        # Heading action logic with persistent steering
         gap_ok = (
             gap_ahead_l1 > GAP_REQUIRED_AHEAD
             and gap_behind_l1 > GAP_REQUIRED_BEHIND
         )
-        if dist_to_blocker < FOLLOW_DISTANCE_MIN:
-            return ACTION_SLOWER
-        
-        if user_speed:
-            if user_speed > 0:
-                return ACTION_FASTER
-            elif user_speed < 0:
-                return ACTION_SLOWER
 
-        if user_steering:
-            if ego_lane == 1:
-                return ACTION_LANE_LEFT
-            if ego_lane == 0:
-                return ACTION_LANE_RIGHT
+        # Check if lane change has completed
+        if self.merge_out_target_lane is not None and ego_lane == self.merge_out_target_lane:
+            # Lane change successful, clear the target
+            self.merge_out_target_lane = None
 
-        # if self.state == STATE_MERGE_BACK:
-        #     if ego_lane == 0:
-        #         self.state = STATE_CLEAR
-        #         return ACTION_IDLE
-        #     return ACTION_LANE_LEFT
+        # If user provides new steering input, update target; otherwise persist
+        action_steering = ACTION_IDLE
+        if user_steering != 0:
+            # User is providing steering input
+            if gap_ok:
+                if user_steering > 0:
+                    action_steering = ACTION_LANE_LEFT  # Lane left
+                    self.merge_out_target_lane = 0
+                elif user_steering < 0:
+                    action_steering = ACTION_LANE_RIGHT   # Lane right
+                    self.merge_out_target_lane = 1
+        elif self.merge_out_target_lane is not None:
+            # User is not steering, but we're in the middle of a merge; persist
+            if self.merge_out_target_lane == 1:
+                action_steering = ACTION_LANE_RIGHT  # Continue RIGHT
+            elif self.merge_out_target_lane == 0:
+                action_steering = ACTION_LANE_LEFT   # Continue LEFT
 
-        return ACTION_IDLE
+        return (action_speed, action_steering)
 
     def act(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple) -> np.ndarray:
         """Execute the state machine and return a 2D continuous action [acceleration, steering].
         
-        Maps discrete actions to continuous outputs:
-        - ACTION_FASTER → [+1.0, 0.0]  (accelerate, neutral steering)
-        - ACTION_SLOWER → [-1.0, 0.0]  (brake, neutral steering)
-        - ACTION_LANE_LEFT → [0.0, -1.0]  (neutral speed, steer left)
-        - ACTION_LANE_RIGHT → [0.0, +1.0]  (neutral speed, steer right)
-        - ACTION_IDLE → [0.0, 0.0]  (no action)
+        Combines separate speed and heading actions (from act_upper) into continuous outputs:
+        - speed_action ∈ {-1, 0, +1} → acceleration via speed_control
+        - heading_action ∈ {-1, 0, +1} → steering via steering_control, with persistence during merges
         """
-        # Get the discrete action from the state machine
-        action = self.act_upper(obs, env, user_input)
-        
+        # Attach ego vehicle reference if not already attached
         ego = env.controlled_vehicles[0]
+
+        self.v = ControlledVehicle(ego.road, ego.position, ego.heading, ego.speed, ego.lane_index)        # Get speed and heading actions separately
+        action_speed, action_steering = self.act_upper(obs, env, user_input)
+
         ego_lane = int(round(ego.position[1] / StraightLane.DEFAULT_WIDTH))
         ego_velocity_x = ego.velocity[0]
         ego_velocity_y = ego.velocity[1]
         ego_velocity = np.linalg.norm([ego_velocity_x, ego_velocity_y])
-        
-        command = [0.0,0.0]
+
+        command = np.array([0.0, 0.0])  # [acceleration, steering]
         # Map discrete action to continuous 2D output [acceleration, steering]
-        if action == ACTION_FASTER:
-            command[0] = ego.speed_control(target_speed=(ego_velocity + 1.0))
-        elif action == ACTION_SLOWER:
-            command[0] = ego.speed_control(target_speed=(ego_velocity - 1.0))
-        elif action == ACTION_LANE_LEFT:
-            command[1] = ego.steering_control(target_lane_index=LaneIndex(1))
-        elif action == ACTION_LANE_RIGHT:
-            command[1] = ego.steering_control(target_lane_index=LaneIndex(0))
-        else:  # ACTION_IDLE or default
-            command = np.array([0.0, 0.0], dtype=np.float32)
-        
-        print(command)
-        return np.array(command, dtype=np.float32)
+        if action_speed == ACTION_FASTER:
+            command[0] = self.v.speed_control(target_speed=(ego_velocity + 0.5))
+        elif action_speed == ACTION_SLOWER:
+            command[0] = self.v.speed_control(target_speed=(ego_velocity - 1.0))
+        elif action_speed == ACTION_IDLE:
+            command[0] = self.v.speed_control(target_speed=ego_velocity)
+
+        _from, _to, _id = ego.lane_index
+        lane_1 = (_from, _to, 1)
+        lane_0 = (_from, _to, 0)
+
+        # Apply heading action (with persistence during merge)
+        if action_steering == ACTION_LANE_LEFT:  # Lane left
+            command[1] = self.v.steering_control(target_lane_index=lane_0)
+        elif action_steering == ACTION_LANE_RIGHT:  # Lane right
+            command[1] = self.v.steering_control(target_lane_index=lane_1)
+        else:
+            if ego_lane == 0:
+                command[1] = self.v.steering_control(target_lane_index=lane_0)
+            else:
+                command[1] = self.v.steering_control(target_lane_index=lane_1)
+        return command.flatten().astype(np.float32)
 
 
     @staticmethod
@@ -123,7 +165,7 @@ class OvertakingController:
         for vehicle in env.road.vehicles:
             if vehicle is ego:
                 continue
-            vehicle_lane = int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
+            vehicle_lane = vehicle.lane_index[2]#int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
             if vehicle_lane != lane_id:
                 continue
             dx = vehicle.position[0] - ego_x
@@ -144,7 +186,7 @@ class OvertakingController:
         for vehicle in env.road.vehicles:
             if vehicle is ego:
                 continue
-            vehicle_lane = int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
+            vehicle_lane = vehicle.lane_index[2]#int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
             if vehicle_lane != lane_id:
                 continue
             dx = vehicle.position[0] - ego_x
@@ -165,7 +207,7 @@ class OvertakingController:
         for vehicle in env.road.vehicles:
             if vehicle is ego:
                 continue
-            vehicle_lane = int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
+            vehicle_lane = vehicle.lane_index[2]#int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
             if vehicle_lane != lane_id:
                 continue
             dx = ego_x - vehicle.position[0]

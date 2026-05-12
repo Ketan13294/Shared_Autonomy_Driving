@@ -11,7 +11,7 @@ from highway_env.vehicle.behavior import IDMVehicle
 from highway_env.vehicle.controller import MDPVehicle, ControlledVehicle
 from highway_env.vehicle.kinematics import Vehicle
 
-from overtaking_constants import PATTERN_CLUSTER, PATTERN_MIXED, PATTERN_SPARSE
+from overtaking_constants import PATTERN_CLUSTER, PATTERN_MIXED, PATTERN_OVERTAKING, PATTERN_SPARSE
 
 
 class TwoLaneOvertakingEnv(HighwayEnv):
@@ -38,42 +38,38 @@ class TwoLaneOvertakingEnv(HighwayEnv):
                 #     "type": "DiscreteMetaAction",
                 #     "target_speeds": [15, 17.5, 20, 22.5, 25, 27.5, 30],
                 # },
-                # Continuous actions let the policy choose any acceleration and steering, which is more realistic but harder to learn from.
                 "action": {
                     "type": "ContinuousAction",
-                    "longitudinal": True,
-                    "lateral": True,
-                    "dynamical": True,
-                },
+                },               
                 # Kinematics observations expose nearby vehicles directly to the policy.
-                "observation": {
-                    "type": "Kinematics",
-                    "vehicles_count": 8,
-                    "features": ["presence", "x", "y", "vx", "vy", "cos_h", "sin_h", "ang_off"],
-                    "normalize": True,
-                    "absolute": True,
-                },
-                # Image observations expose nearby vehicles to the policy through rendering, which is more realistic but harder to learn from.
-                # "observations":{
-                #     "type" : "GrayscaleObservation",
-                #     "observation_shape": (128, 84),
-                #     "stack_size": 4,
-                #     "weights": [0.2989, 0.5870, 0.1140],  # weights for RGB conversion
-                #     "scaling": 1.75,
+                # "observation": {
+                #     "type": "Kinematics",
+                #     "vehicles_count": 8,
+                #     "features": ["presence", "x", "y", "vx", "vy", "cos_h", "sin_h"],
+                #     "normalize": True,
+                #     "absolute": False,
                 # },
+                # Image observations expose nearby vehicles to the policy through rendering, which is more realistic but harder to learn from.
+                "observation":{
+                    "type" : "GrayscaleObservation",
+                    "observation_shape": (128, 64),
+                    "stack_size": 4,
+                    "weights": [0.2989, 0.5870, 0.1140],  # weights for RGB conversion
+                    "scaling": 1.75,
+                },
                 # Reward values encourage safe progress while penalizing collisions and unnecessary weaving.
                 "collision_reward": -5.0,
                 "high_speed_reward": 0.3,
                 "right_lane_reward": 0.0,
                 "lane_change_reward": 0.00,
-                "reward_speed_range": [20, 30],
+                "reward_speed_range": [-30, 30],
                 "normalize_reward": True,
                 # Episodes are long enough for one or two overtakes, but not long enough to become a cruising task.
                 "duration": 90,
                 "simulation_frequency": 15,
-                "policy_frequency": 2,
+                "policy_frequency": 15,
                 # Traffic presets let training cover different densities without changing the environment definition.
-                "traffic_pattern": PATTERN_CLUSTER,
+                "traffic_pattern": PATTERN_MIXED,
                 "vehicles_count": 0,
                 "manual_control": False,
             }
@@ -113,11 +109,11 @@ class TwoLaneOvertakingEnv(HighwayEnv):
 
         # Randomly assign ego and blocker to lanes and positions.
         ego_lane_id = int(self.np_random.choice([0, 1]))
-        blocker_lane_id = int(self.np_random.choice([0, 1]))
+        blocker_lane_id = ego_lane_id #int(self.np_random.choice([0, 1]))
         
         # Sample longitudinal positions from a range to avoid spawning too close to the road edge.
         ego_x = float(self.np_random.uniform(40.0, 150.0))
-        blocker_x = float(self.np_random.uniform(40.0, 300.0))
+        blocker_x = ego_x + float(self.np_random.uniform(25.0, 30.0))
         
         # Ensure ego and blocker are not too close (at least 30 units apart if in the same lane).
         if ego_lane_id == blocker_lane_id and abs(ego_x - blocker_x) < 30.0:
@@ -164,7 +160,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
         # Continuous control uses the base Vehicle class; discrete control uses highway-env's MDPVehicle wrapper.
         action_type = self.config.get("action", {}).get("type", "DiscreteMetaAction")
         if action_type == "ContinuousAction":
-            return ControlledVehicle
+            return Vehicle
         return MDPVehicle
 
     def _make_idm(
