@@ -11,7 +11,7 @@ import threading
 
 from highway_env.road.lane import StraightLane
 
-from overtaking_constants import PATTERNS, STATE_CLEAR
+from overtaking_constants import PATTERNS, STATE_CLEAR, ACTION_FASTER, ACTION_SLOWER, ACTION_LANE_LEFT, ACTION_LANE_RIGHT, ACTION_IDLE, FOLLOW_DISTANCE_MIN, FOLLOW_DISTANCE_OK, GAP_REQUIRED_AHEAD, GAP_REQUIRED_BEHIND, SAFE_RETURN_GAP
 from overtaking_controller import OvertakingController
 from overtaking_environment import register_two_lane_overtaking_env, TwoLaneOvertakingEnv
 
@@ -71,8 +71,11 @@ def run_simulation(
     """Run the overtaking scenario for *n_episodes* episodes."""
     register_two_lane_overtaking_env()
 
+    config = TwoLaneOvertakingEnv.default_config()
+    config.update({"manual_control": False})
+
     render_mode = "human" if render else None
-    env = gym.make("TwoLaneOvertaking-v0", render_mode=render_mode)
+    env = gym.make("TwoLaneOvertaking-v0", render_mode=render_mode,config=config)
     
     controller = OvertakingController()
     # Start a background keyboard poller so key reads are independent of loop
@@ -90,6 +93,7 @@ def run_simulation(
 
         obs, info = env.reset()
         controller.reset()
+        env.unwrapped.controller = controller
 
         total_reward = 0.0
         step = 0
@@ -100,9 +104,10 @@ def run_simulation(
             # Read the most-recent keyboard state from the background poller
             user_turn = poller.user_turn
             user_speed_delta = poller.user_speed_delta
+            # user_speed_delta, user_turn = _teacher_user_input(env.unwrapped)
             quit_requested = poller.quit_requested
 
-            action = controller.act(obs, env.unwrapped, [user_speed_delta, user_turn])
+            action = controller.act(obs, env.unwrapped, [user_speed_delta, user_turn],False)
 
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated

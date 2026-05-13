@@ -17,6 +17,10 @@ from overtaking_constants import PATTERN_CLUSTER, PATTERN_MIXED, PATTERN_OVERTAK
 class TwoLaneOvertakingEnv(HighwayEnv):
     """A two-lane highway environment purpose-built for overtaking."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.controller = None
+
     @classmethod
     def default_config(cls) -> dict:
         # Keep the environment short and structured so overtaking is the main challenge.
@@ -62,7 +66,7 @@ class TwoLaneOvertakingEnv(HighwayEnv):
                 "high_speed_reward": 0.3,
                 "right_lane_reward": 0.0,
                 "lane_change_reward": 0.00,
-                "reward_speed_range": [-30, 30],
+                "reward_speed_range": [-20, 20],
                 "normalize_reward": True,
                 # Episodes are long enough for one or two overtakes, but not long enough to become a cruising task.
                 "duration": 90,
@@ -75,6 +79,23 @@ class TwoLaneOvertakingEnv(HighwayEnv):
             }
         )
         return config
+
+    def step(self, action):
+        """Step the environment and check for controller-based termination.
+        
+        If the controller reaches STATE_CLEAR, the episode is truncated (early termination).
+        """
+        # Call parent step to get the normal step outputs
+        obs, reward, terminated, truncated, info = super().step(action)
+        
+        # Check if controller has reached STATE_CLEAR and truncate the episode
+        if self.controller is not None:
+            if hasattr(self.controller, 'state'):
+                from overtaking_constants import STATE_CLEAR
+                if self.controller.state == STATE_CLEAR:
+                    truncated = True
+        
+        return obs, reward, terminated, truncated, info
 
     def _create_road(self) -> None:
         net = RoadNetwork()

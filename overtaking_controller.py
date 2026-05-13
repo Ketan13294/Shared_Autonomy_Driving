@@ -20,6 +20,7 @@ from overtaking_constants import (
     GAP_REQUIRED_AHEAD,
     GAP_REQUIRED_BEHIND,
     SAFE_RETURN_GAP,
+    STATE_APPROACH,
     STATE_CHECKING,
     STATE_CLEAR,
     STATE_FOLLOW,
@@ -34,18 +35,22 @@ class OvertakingController:
     """A rule-based state-machine controller for the overtaking manoeuvre."""
 
     def __init__(self) -> None:
-        self.state = STATE_CLEAR
+        self.state = STATE_APPROACH
         # A live reference to the ego vehicle so controller and env share the same object
         self.v = None
         # Track the target lane for persistent steering during merges
         self.merge_out_target_lane = None
+        self.home_lane = None
+        self.home_lane_set = False
 
     def reset(self) -> None:
-        self.state = STATE_CLEAR
+        self.state = STATE_APPROACH
         # Clear the cached ego reference; will be re-attached on next action
         self.v = None
         # Clear the merge target when resetting
         self.merge_out_target_lane = None
+        self.home_lane = None
+        self.home_lane_set = False
 
     def act_upper(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple) -> tuple[int, int]:
         """
@@ -109,7 +114,7 @@ class OvertakingController:
 
         return (action_speed, action_steering)
 
-    def act(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple) -> np.ndarray:
+    def act(self, obs: np.ndarray, env: "TwoLaneOvertakingEnv", user_input: tuple, use_teacher: bool) -> np.ndarray:
         """Execute the state machine and return a 2D continuous action [acceleration, steering].
         
         Combines separate speed and heading actions (from act_upper) into continuous outputs:
@@ -120,7 +125,10 @@ class OvertakingController:
         ego = env.controlled_vehicles[0]
 
         self.v = ControlledVehicle(ego.road, ego.position, ego.heading, ego.speed, ego.lane_index)        # Get speed and heading actions separately
-        action_speed, action_steering = self.act_upper(obs, env, user_input)
+        if use_teacher:
+            action_speed, action_steering = self._teacher_user_input(env)
+        else:
+            action_speed, action_steering = self.act_upper(obs, env, user_input)
 
         ego_lane = int(round(ego.position[1] / StraightLane.DEFAULT_WIDTH))
         ego_velocity_x = ego.velocity[0]
@@ -130,9 +138,9 @@ class OvertakingController:
         command = np.array([0.0, 0.0])  # [acceleration, steering]
         # Map discrete action to continuous 2D output [acceleration, steering]
         if action_speed == ACTION_FASTER:
-            command[0] = self.v.speed_control(target_speed=(ego_velocity + 0.5))
+            command[0] = self.v.speed_control(target_speed=(min(ego_velocity + 0.5,30.0)))
         elif action_speed == ACTION_SLOWER:
-            command[0] = self.v.speed_control(target_speed=(ego_velocity - 1.0))
+            command[0] = self.v.speed_control(target_speed=(max(ego_velocity - 5.0, 0.0 )))
         elif action_speed == ACTION_IDLE:
             command[0] = self.v.speed_control(target_speed=ego_velocity)
 
@@ -152,6 +160,75 @@ class OvertakingController:
                 command[1] = self.v.steering_control(target_lane_index=lane_1)
         return command.flatten().astype(np.float32)
 
+    def _teacher_user_input(self, env) -> tuple[int, int]:
+        ego = env.controlled_vehicles[0]
+        ego_lane = self._lane_id(ego)
+        other_lane = ego_lane ^ 1
+
+        if not self.home_lane_set:
+            self.home_lane = ego_lane
+            self.home_lane_set = True
+        
+        dist_to_blocker = self._signed_dist_nearest_in_lane(env, ego, lane_id=ego_lane)
+        dist_to_blocker_prev_lane = self._signed_dist_nearest_in_lane(env, ego, lane_id=self.home_lane)
+        gap_ahead_other, gap_behind_other = self._scan_lane(env, ego, lane_id=other_lane)
+
+        if self.state == STATE_APPROACH:
+            return ACTION_IDLE, ACTION_IDLE
+        
+        if self.state == STATE_CLEAR:
+            return ACTION_FASTER, ACTION_IDLE
+
+        if self.state == STATE_FOLLOW:
+            if dist_to_blocker < FOLLOW_DISTANCE_MIN:
+                return ACTION_SLOWER, ACTION_IDLE
+            if dist_to_blocker < FOLLOW_DISTANCE_OK:
+                self.state = STATE_CHECKING
+            return ACTION_IDLE, ACTION_IDLE
+
+        if self.state == STATE_CHECKING:
+            gap_ok = (
+                gap_ahead_other > GAP_REQUIRED_AHEAD
+                and gap_behind_other > GAP_REQUIRED_BEHIND
+            )
+            if gap_ok:
+                self.state = STATE_MERGE_OUT
+            if dist_to_blocker < FOLLOW_DISTANCE_MIN:
+                return ACTION_SLOWER, ACTION_IDLE
+            if dist_to_blocker > FOLLOW_DISTANCE_OK * 2:
+                self.state = STATE_FOLLOW
+            return ACTION_IDLE, ACTION_IDLE
+
+        if self.state == STATE_MERGE_OUT:
+            if ego_lane != self.home_lane:
+                self.state = STATE_PASSING
+                return ACTION_FASTER, ACTION_IDLE
+            if self.home_lane == 0:
+                return ACTION_IDLE, ACTION_LANE_RIGHT
+            else:
+                return ACTION_IDLE, ACTION_LANE_LEFT
+
+        if self.state == STATE_PASSING:
+            if dist_to_blocker_prev_lane < -SAFE_RETURN_GAP:
+                gap_behind_l0 = self._gap_behind_in_lane(env, ego, lane_id=self.home_lane)
+                if gap_behind_l0 > 20.0:
+                    self.state = STATE_MERGE_BACK
+            return ACTION_FASTER, ACTION_IDLE
+
+        if self.state == STATE_MERGE_BACK:
+            if ego_lane == self.home_lane:
+                self.state = STATE_CLEAR
+                self.home_lane = None
+                self.home_lane_set = False
+                return ACTION_IDLE, ACTION_IDLE
+            if self.home_lane == 0:
+                return ACTION_IDLE, ACTION_LANE_LEFT
+            else:
+                return ACTION_IDLE, ACTION_LANE_RIGHT 
+        if self.state == STATE_CLEAR:
+            if dist_to_blocker < FOLLOW_DISTANCE_OK * 2:
+                self.state = STATE_APPROACH
+        return ACTION_IDLE, ACTION_IDLE
 
     @staticmethod
     def _signed_dist_nearest_in_lane(
@@ -173,6 +250,10 @@ class OvertakingController:
                 best_dist = dx
                 found_any = True
         return best_dist
+
+    @staticmethod
+    def _lane_id(vehicle) -> int:
+        return int(round(vehicle.position[1] / StraightLane.DEFAULT_WIDTH))
 
     @staticmethod
     def _scan_lane(

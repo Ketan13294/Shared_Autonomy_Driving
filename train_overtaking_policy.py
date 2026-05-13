@@ -86,24 +86,6 @@ def _flatten_observation(obs) -> np.ndarray:
     return np.asarray(obs, dtype=np.float32).reshape(-1)
 
 
-def _build_env_config(stack_size: int, traffic_pattern: str) -> dict:
-    config = TwoLaneOvertakingEnv.default_config()
-    config.update(
-        {
-
-            "observation": {
-                "type": "GrayscaleObservation",
-                "observation_shape": OBSERVATION_SHAPE,
-                "stack_size": stack_size,
-                "weights": [0.2989, 0.5870, 0.1140],
-                "scaling": 1.75,
-            },
-            "traffic_pattern": traffic_pattern,
-        }
-    )
-    return config
-
-
 def _teacher_user_input(env) -> tuple[int, int]:
     """Generate a user-input pair that produces overtaking behavior.
 
@@ -134,11 +116,11 @@ def _teacher_user_input(env) -> tuple[int, int]:
         if 0.0 < dist_to_blocker < FOLLOW_DISTANCE_OK and lane_change_safe:
             user_turn = ACTION_LANE_RIGHT
     else:
-        if dist_to_blocker > SAFE_RETURN_GAP and lane_change_safe:
+        # Merge back after the overtake once the original lane is safely clear behind us.
+        if gap_behind_other > SAFE_RETURN_GAP and lane_change_safe:
             user_turn = ACTION_LANE_LEFT
 
     return user_speed_delta, user_turn
-
 
 class BehaviorMLP(nn.Module):
     """MLP that maps stacked grayscale observations to continuous actions."""
@@ -187,10 +169,11 @@ def collect_trajectories(
             env.unwrapped.config["traffic_pattern"] = pattern
             obs, _ = env.reset(seed=seed + episode)
             controller.reset()
+            env.unwrapped.controller = controller
 
             for step in range(max_steps):
                 teacher_user_input = _teacher_user_input(env.unwrapped)
-                action = controller.act(obs, env.unwrapped, teacher_user_input)
+                action = env.unwrapped.controller.act(obs, env.unwrapped, teacher_user_input)
 
                 observations.append(_flatten_observation(obs))
                 actions.append(np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0))
